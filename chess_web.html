@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Chess (Python via Pyodide)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Symbols+2:wght@400&display=swap" rel="stylesheet">
+    <style>
+      body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background: #0b0f14; color: #e8eef6; }
+      header { padding: 16px 16px 6px; }
+      h1 { margin: 0; font-size: 20px; }
+      #root { display: grid; grid-template-columns: auto 320px; gap: 16px; padding: 12px; }
+      #board { width: min(80vmin, 720px); aspect-ratio: 1; background: #121821; border: 1px solid #223043; border-radius: 10px; overflow: hidden; }
+      .rank { display: grid; grid-template-columns: repeat(8, 1fr); height: 12.5%; }
+      .cell { display: flex; align-items: center; justify-content: center; font-size: clamp(18px, 8vmin, 64px); cursor: pointer; user-select: none; line-height: 1; font-family: 'Noto Sans Symbols 2', 'Segoe UI Symbol', 'DejaVu Sans', 'Arial Unicode MS', system-ui, sans-serif; }
+      .light { background: #f0d9b5; color: #111; }
+      .dark { background: #b58863; color: #111; }
+      .sel { outline: 4px solid #f6f669; position: relative; z-index: 1; }
+      .hint { box-shadow: inset 0 0 0 4px rgba(115,149,82,0.9); }
+      #side { background: #121821; border: 1px solid #223043; border-radius: 10px; padding: 12px; }
+      #status { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: #0f141c; border: 1px solid #223043; border-radius: 8px; padding: 8px; height: 40vh; overflow: auto; }
+      button { background: #3fa9f5; color: #081018; border: 1px solid #2a628f; border-radius: 8px; padding: 8px 12px; cursor: pointer; font-weight: 600; }
+      button:disabled { opacity: .6; cursor: default; }
+    </style>
+    <script src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>Browser Chess — Python (Pyodide) with AI</h1>
+    </header>
+    <div id="root">
+      <div id="board" aria-label="chessboard"></div>
+      <div id="side">
+        <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px; flex-wrap: wrap;">
+          <button id="btn-new">New Game</button>
+          <button id="btn-ai" title="AI plays Black">AI Move</button>
+          <button id="btn-toggle">Toggle Pieces</button>
+        </div>
+        <div id="counts" style="display:grid; grid-template-columns: 1fr 1fr; gap:10px; margin-bottom:10px;"></div>
+        <div id="status" aria-live="polite"></div>
+      </div>
+    </div>
+
+    <script>
+      const boardEl = document.getElementById('board');
+      const statusEl = document.getElementById('status');
+      const btnNew = document.getElementById('btn-new');
+      const btnAI  = document.getElementById('btn-ai');
+
+      // Build DOM board
+      const squares = [];
+      for (let r = 0; r < 8; r++) {
+        const rank = document.createElement('div');
+        rank.className = 'rank';
+        for (let f = 0; f < 8; f++) {
+          const cell = document.createElement('div');
+          cell.className = 'cell ' + (((r + f) % 2 === 0) ? 'light' : 'dark');
+          cell.dataset.r = r;
+          cell.dataset.f = f;
+          rank.appendChild(cell);
+          squares.push(cell);
+        }
+        boardEl.appendChild(rank);
+      }
+
+      let pyodideReady = null;
+      let py = null;
+      let gameProxy = null;
+      let selected = null;
+      let legalForSelected = [];
+
+      function setStatus(text) {
+        statusEl.textContent += text + '\n';
+        statusEl.scrollTop = statusEl.scrollHeight;
+      }
+
+      let useAscii = false;
+
+      function renderBoard(boardStr) {
+        // boardStr is 8 lines of 8 chars
+        const rows = boardStr.trim().split('\n');
+        for (let r = 0; r < 8; r++) {
+          for (let f = 0; f < 8; f++) {
+            const cell = squares[r * 8 + f];
+            const ch = rows[r][f];
+            let glyph = '';
+            if (useAscii) {
+              glyph = ch === '.' ? '' : ch; // show raw letters as fallback
+            } else {
+              const map = {
+                'K':'\u2654','Q':'\u2655','R':'\u2656','B':'\u2657','N':'\u2658','P':'\u2659',
+                'k':'\u265A','q':'\u265B','r':'\u265C','b':'\u265D','n':'\u265E','p':'\u265F','.' : ''
+              };
+              glyph = map[ch] || '';
+            }
+            cell.textContent = glyph;
+            cell.classList.remove('sel','hint');
+          }
+        }
+      }
+
+      async function ensurePyodide() {
+        if (!pyodideReady) {
+          pyodideReady = loadPyodide({ indexURL: 'https://cdn.jsdelivr.net/pyodide/v0.25.1/full/' }).then(async (pyodide) => {
+            py = pyodide;
+            await py.loadPackagesFromImports('import sys');
+            await py.runPythonAsync(`
+import sys, math, copy
+
+# Reuse logic similar to chess_game.py (simplified to essential parts)
+class ChessGame:
+    def __init__(self):
+        self.board = [list("rnbqkbnr"),list("pppppppp"),list("........"),list("........"),list("........"),list("........"),list("PPPPPPPP"),list("RNBQKBNR")]
+        self.white_to_move = True
+        self.castling_rights = {'K': True, 'Q': True, 'k': True, 'q': True}
+        self.en_passant = None
+
+    def board_str(self):
+        return "\n".join("".join(row) for row in self.board)
+
+    def is_white(self, p): return p.isupper()
+    def is_black(self, p): return p.islower()
+    def in_bounds(self, r, f): return 0 <= r < 8 and 0 <= f < 8
+
+    def get_king_square(self, white):
+        k = 'K' if white else 'k'
+        for r in range(8):
+            for f in range(8):
+                if self.board[r][f]==k: return (r,f)
+        return None
+
+    def generate_legal_moves(self):
+        moves = []
+        for r in range(8):
+            for f in range(8):
+                p = self.board[r][f]
+                if p=='.': continue
+                if self.white_to_move and not self.is_white(p): continue
+                if (not self.white_to_move) and not self.is_black(p): continue
+                for (r2,f2,promo) in self._pseudo((r,f), p):
+                    g = copy.deepcopy(self)
+                    if g._apply((r,f),(r2,f2),promo,validate=False) and not g._in_check(white=self.white_to_move):
+                        moves.append(((r,f),(r2,f2),promo))
+        return moves
+
+    def _pseudo(self, sq, p):
+        r,f = sq
+        white = self.is_white(p)
+        enemy = (self.is_black if white else self.is_white)
+        out = []
+        if p.upper()=='P':
+            d = -1 if white else 1
+            r1=r+d
+            if self.in_bounds(r1,f) and self.board[r1][f]=='.':
+                if r1==(0 if white else 7):
+                    for Q in 'QRBN': out.append((r1,f,Q))
+                else: out.append((r1,f,None))
+                start=6 if white else 1
+                r2=r+2*d
+                if r==start and self.board[r2][f]=='.': out.append((r2,f,None))
+            for df in (-1,1):
+                rr=r+d; ff=f+df
+                if self.in_bounds(rr,ff):
+                    t=self.board[rr][ff]
+                    if t!='.' and enemy(t):
+                        if rr==(0 if white else 7):
+                            for Q in 'QRBN': out.append((rr,ff,Q))
+                        else: out.append((rr,ff,None))
+            # en passant omitted for brevity in web version
+        elif p.upper()=='N':
+            for dr,df in [(2,1),(2,-1),(-2,1),(-2,-1),(1,2),(1,-2),(-1,2),(-1,-2)]:
+                rr=r+dr; ff=f+df
+                if self.in_bounds(rr,ff):
+                    t=self.board[rr][ff]
+                    if t=='.' or enemy(t): out.append((rr,ff,None))
+        elif p.upper()=='B':
+            out+=self._slide(r,f,enemy,[(1,1),(1,-1),(-1,1),(-1,-1)])
+        elif p.upper()=='R':
+            out+=self._slide(r,f,enemy,[(1,0),(-1,0),(0,1),(0,-1)])
+        elif p.upper()=='Q':
+            out+=self._slide(r,f,enemy,[(1,1),(1,-1),(-1,1),(-1,-1),(1,0),(-1,0),(0,1),(0,-1)])
+        elif p.upper()=='K':
+            for dr in (-1,0,1):
+                for df in (-1,0,1):
+                    if dr==0 and df==0: continue
+                    rr=r+dr; ff=f+df
+                    if self.in_bounds(rr,ff):
+                        t=self.board[rr][ff]
+                        if t=='.' or enemy(t): out.append((rr,ff,None))
+            # simplified castling: require empty and not in check squares
+            out+=self._castle(white)
+        return out
+
+    def _slide(self, r,f,enemy,dirs):
+        o=[]
+        for dr,df in dirs:
+            rr=r+dr; ff=f+df
+            while self.in_bounds(rr,ff):
+                t=self.board[rr][ff]
+                if t=='.': o.append((rr,ff,None))
+                else:
+                    if enemy(t): o.append((rr,ff,None))
+                    break
+                rr+=dr; ff+=df
+        return o
+
+    def _castle(self, white):
+        out=[]; r=7 if white else 0
+        if (('K' if white else 'k') in 'Kk'):
+            if self.castling_rights['K' if white else 'k'] and self.board[r][5]=='.' and self.board[r][6]=='.':
+                out.append((r,6,None))
+        if (('Q' if white else 'q') in 'Qq'):
+            if self.castling_rights['Q' if white else 'q'] and self.board[r][1]=='.' and self.board[r][2]=='.' and self.board[r][3]=='.':
+                out.append((r,2,None))
+        return out
+
+    def _in_check(self, white):
+        kr,kf = self.get_king_square(white)
+        return self._attacked((kr,kf), not white)
+
+    def _attacked(self, sq, by_white):
+        r,f=sq
+        for rr in range(8):
+            for ff in range(8):
+                p=self.board[rr][ff]
+                if p=='.': continue
+                if by_white and not p.isupper(): continue
+                if (not by_white) and not p.islower(): continue
+                for (tr,tf,_) in self._pseudo((rr,ff), p):
+                    if (tr,tf)==(r,f): return True
+        return False
+
+    def _apply(self, src, dst, promo, validate=True):
+        sr,sf=src; dr,df=dst
+        p=self.board[sr][sf]
+        if p=='.': return False
+        # basic validation optional
+        if validate:
+            legal=self.generate_legal_moves()
+            if (src,dst,promo) not in legal:
+                if not any(m[0]==src and m[1]==dst for m in legal):
+                    return False
+        # castling rook move
+        if p.upper()=='K' and abs(df-sf)==2:
+            r=dr
+            if df==6: self.board[r][5]=self.board[r][7]; self.board[r][7]='.'
+            if df==2: self.board[r][3]=self.board[r][0]; self.board[r][0]='.'
+        self.board[dr][df]=p
+        self.board[sr][sf]='.'
+        if p.upper()=='P' and (dr==0 or dr==7):
+            self.board[dr][df] = (promo if promo else 'Q') if p.isupper() else (promo.lower() if promo else 'q')
+        self.white_to_move = not self.white_to_move
+        return True
+
+    def is_checkmate(self):
+        if not self._in_check(self.white_to_move): return False
+        return len(self.generate_legal_moves())==0
+    def is_stalemate(self):
+        if self._in_check(self.white_to_move): return False
+        return len(self.generate_legal_moves())==0
+
+def board_pretty(g: ChessGame):
+    rows = []
+    for r in range(8):
+        rows.append(''.join(g.board[r]))
+    return "\n".join(rows)
+
+game = ChessGame()
+def get_board():
+    return game.board_str()
+def reset():
+    global game; game = ChessGame(); return game.board_str()
+def legal_from(r,f):
+    res = []
+    for mv in game.generate_legal_moves():
+        if mv[0]==(r,f): res.append((mv[1][0], mv[1][1]))
+    return res
+def move(r1,f1,r2,f2,promo=None):
+    ok = game._apply((r1,f1),(r2,f2),promo,validate=True)
+    return ok
+def ai_move(depth=2):
+    # Simple minimax over legal moves
+    legal = game.generate_legal_moves()
+    if not legal: return False
+    best = None
+    best_score = -1e9 if game.white_to_move else 1e9
+    def eval(g):
+        vals = {'P':1,'N':3,'B':3,'R':5,'Q':9,'K':0,'p':-1,'n':-3,'b':-3,'r':-5,'q':-9,'k':0,'.':0}
+        s=0
+        for r in range(8):
+            for f in range(8): s += vals.get(g.board[r][f],0)
+        return s
+    def search(g,d,alpha,beta):
+        if d==0:
+            return eval(g)
+        ms = g.generate_legal_moves()
+        if not ms:
+            if g.is_checkmate():
+                return -9999 if g.white_to_move else 9999
+            return 0
+        if g.white_to_move:
+            val=-1e9
+            for m in ms:
+                gg=copy.deepcopy(g); gg._apply(m[0],m[1],m[2],validate=False)
+                val=max(val, search(gg,d-1,alpha,beta)); alpha=max(alpha,val)
+                if alpha>=beta: break
+            return val
+        else:
+            val=1e9
+            for m in ms:
+                gg=copy.deepcopy(g); gg._apply(m[0],m[1],m[2],validate=False)
+                val=min(val, search(gg,d-1,alpha,beta)); beta=min(beta,val)
+                if alpha>=beta: break
+            return val
+    for m in legal:
+        g2 = copy.deepcopy(game); g2._apply(m[0],m[1],m[2],validate=False)
+        sc = search(g2, depth-1, -1e9, 1e9)
+        if game.white_to_move and sc>best_score: best_score=sc; best=m
+        if (not game.white_to_move) and sc<best_score: best_score=sc; best=m
+    if best is not None:
+        game._apply(best[0],best[1],best[2],validate=False)
+        return True
+    return False
+            `);
+            return py;
+          });
+        }
+        return pyodideReady;
+      }
+
+      function clearHints() {
+        squares.forEach(c => { c.classList.remove('sel','hint'); });
+        legalForSelected = [];
+      }
+
+      async function syncBoard() {
+        const s = await py.runPythonAsync('get_board()');
+        renderBoard(s);
+        updateCountsFromBoard(s);
+      }
+
+      async function appendStatus() {
+        const s = await py.runPythonAsync('board_pretty(game)');
+        setStatus('\n' + s);
+        const cm = await py.runPythonAsync('game.is_checkmate()');
+        const sm = await py.runPythonAsync('game.is_stalemate()');
+        if (cm) setStatus('Checkmate!');
+        else if (sm) setStatus('Stalemate.');
+      }
+
+      function cellAt(r,f) { return squares[r*8+f]; }
+
+      async function onCellClick(ev) {
+        await ensurePyodide();
+        const r = parseInt(ev.currentTarget.dataset.r,10);
+        const f = parseInt(ev.currentTarget.dataset.f,10);
+
+        const isWhiteToMove = await py.runPythonAsync('str(game.white_to_move)');
+        const piece = await py.runPythonAsync(`game.board[${r}][${f}]`);
+        if (selected === null) {
+          // Select own piece
+          if ((isWhiteToMove==='True' && /[A-Z]/.test(piece)) || (isWhiteToMove==='False' && /[a-z]/.test(piece))) {
+            selected = { r, f };
+            const list = await py.runPythonAsync(`legal_from(${r},${f})`);
+            legalForSelected = list.toJs();
+            cellAt(r,f).classList.add('sel');
+            legalForSelected.forEach(([rr,ff]) => cellAt(rr,ff).classList.add('hint'));
+          }
+        } else {
+          // Attempt move
+          const isDest = legalForSelected.some(([rr,ff]) => rr===r && ff===f);
+          if (!isDest) { clearHints(); selected = null; return; }
+
+          // Promotion prompt if pawn to last rank
+          const srcPiece = await py.runPythonAsync(`game.board[${selected.r}][${selected.f}]`);
+          let promo = null;
+          if ((srcPiece==='P' && r===0) || (srcPiece==='p' && r===7)) {
+            promo = prompt('Promote to (Q/R/B/N):','Q');
+            if (promo) promo = promo[0].toUpperCase();
+          }
+          const ok = await py.runPythonAsync(`move(${selected.r},${selected.f},${r},${f}, ${promo?`'${promo}'`:'None'})`);
+          if (ok) {
+            clearHints(); selected = null;
+            await syncBoard();
+            await appendStatus();
+            // AI move
+            const cm = await py.runPythonAsync('game.is_checkmate()');
+            const sm = await py.runPythonAsync('game.is_stalemate()');
+            if (!cm && !sm) {
+              await py.runPythonAsync('ai_move(2)');
+              await syncBoard();
+              await appendStatus();
+            }
+          } else {
+            setStatus('Illegal move.');
+          }
+        }
+      }
+
+      squares.forEach(c => c.addEventListener('click', onCellClick));
+
+      btnNew.addEventListener('click', async () => { await ensurePyodide(); await py.runPythonAsync('reset()'); await syncBoard(); setStatus('New game.'); });
+      btnAI.addEventListener('click', async () => { await ensurePyodide(); await py.runPythonAsync('ai_move(2)'); await syncBoard(); await appendStatus(); });
+      document.getElementById('btn-toggle').addEventListener('click', () => {
+        useAscii = !useAscii;
+        syncBoard();
+        setStatus('Toggled piece style. If symbols do not show, try another browser.');
+      });
+
+      (async () => { await ensurePyodide(); await syncBoard(); setStatus('Ready. Click a piece to move.'); await appendStatus(); })();
+
+      // Piece inventory counts for each side
+      const countsEl = document.getElementById('counts');
+      function updateCountsFromBoard(boardStr) {
+        const flat = boardStr.replace(/\n/g, '');
+        const tally = { K:0,Q:0,R:0,B:0,N:0,P:0, k:0,q:0,r:0,b:0,n:0,p:0 };
+        for (const ch of flat) if (tally.hasOwnProperty(ch)) tally[ch]++;
+        const mapUni = {K:'\u2654',Q:'\u2655',R:'\u2656',B:'\u2657',N:'\u2658',P:'\u2659',k:'\u265A',q:'\u265B',r:'\u265C',b:'\u265D',n:'\u265E',p:'\u265F'};
+        const renderPiece = (ch) => useAscii ? ch : mapUni[ch];
+        const left = [ ['White', ['K','Q','R','R','B','B','N','N','P','P','P','P','P','P','P','P']] ];
+        const right = [ ['Black', ['k','q','r','r','b','b','n','n','p','p','p','p','p','p','p','p']] ];
+        const mk = (side, arr) => {
+          const span = document.createElement('div');
+          span.style.background = '#0f141c';
+          span.style.border = '1px solid #223043';
+          span.style.borderRadius = '8px';
+          span.style.padding = '8px';
+          const title = document.createElement('div');
+          title.textContent = side;
+          title.style.fontWeight = '700';
+          title.style.marginBottom = '6px';
+          span.appendChild(title);
+          const grid = document.createElement('div');
+          grid.style.display = 'grid';
+          grid.style.gridTemplateColumns = 'repeat(4, 1fr)';
+          grid.style.gap = '6px';
+          const seen = {};
+          for (const ch of arr) {
+            seen[ch] = (seen[ch]||0) + 1;
+          }
+          for (const ch in seen) {
+            const need = seen[ch];
+            const have = tally[ch];
+            const item = document.createElement('div');
+            item.style.display='flex'; item.style.alignItems='center'; item.style.gap='6px';
+            const sym = document.createElement('div'); sym.textContent = renderPiece(ch); sym.style.fontSize='22px';
+            const txt = document.createElement('div'); txt.textContent = `${have}/${need}`;
+            item.appendChild(sym); item.appendChild(txt);
+            grid.appendChild(item);
+          }
+          span.appendChild(grid);
+          return span;
+        };
+        countsEl.innerHTML = '';
+        countsEl.appendChild(mk(left[0][0], left[0][1]));
+        countsEl.appendChild(mk(right[0][0], right[0][1]));
+      }
+    </script>
+  </body>
+</html>
+
+
